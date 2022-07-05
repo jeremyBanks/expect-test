@@ -163,7 +163,7 @@ fn update_expect() -> bool {
     env::var("UPDATE_EXPECT").is_ok()
 }
 
-/// Creates an instance of `Expect` from string literal:
+/// Creates an instance of `Expect` from a string literal:
 ///
 /// ```
 /// # use expect_test::expect;
@@ -190,6 +190,67 @@ macro_rules! expect {
     [[]] => { $crate::expect![[""]] };
 }
 
+/// Creates an instance of `Expect` from a string literal:
+///
+/// ```
+/// # use expect_test::expect;
+/// expect!("
+///     Foo { value: 92 }
+/// ");
+/// expect!(r#"{"Foo": 92}"#);
+/// ```
+///
+/// Leading indentation is stripped.
+///
+/// This uses the `#[track_caller]` attribute to resolve relative file paths.
+/// This [may not work as expected][1] if this is called from a function which als uses `#[track_caller]`,
+/// or if the toolchain is [configured to strip caller information][2].
+/// In these cases you may use the macro form, [`expect!`].
+///
+/// [1]: https://github.com/rust-analyzer/expect-test/issues/15#issuecomment-939308821
+/// [2]: https://doc.rust-lang.org/beta/unstable-book/compiler-flags/location-detail.html
+#[track_caller]
+pub fn expect(data: impl ExpectedData) -> Expect {
+    let location = std::panic::Location::caller();
+    Expect {
+        position: Position {
+            file: location.file(),
+            line: location.line(),
+            column: location.column(),
+        },
+        data: data.str(),
+        indent: true,
+    }
+}
+
+pub trait ExpectedData {
+    fn str(&self) -> &'static str;
+}
+
+impl ExpectedData for &'static str {
+    fn str(&self) -> &'static str {
+        self
+    }
+}
+
+impl ExpectedData for [&'static str; 1] {
+    fn str(&self) -> &'static str {
+        self[0]
+    }
+}
+
+impl ExpectedData for [&'static str; 0] {
+    fn str(&self) -> &'static str {
+        ""
+    }
+}
+
+impl ExpectedData for () {
+    fn str(&self) -> &'static str {
+        ""
+    }
+}
+
 /// Creates an instance of `ExpectFile` from relative or absolute path:
 ///
 /// ```
@@ -212,9 +273,9 @@ macro_rules! expect_file {
 /// ```
 ///
 /// This uses the `#[track_caller]` attribute to resolve relative file paths.
-/// They [won't work correctly][1] if this is called from a function which also uses `#[track_caller]`,
+/// This [may not work as expected][1] if this is called from a function which als uses `#[track_caller]`,
 /// or if the toolchain is [configured to strip caller information][2].
-/// In these cases you must use the macro form, [`expect_file!`].
+/// In these cases you may use the macro form, [`expect_file!`].
 ///
 /// [1]: https://github.com/rust-analyzer/expect-test/issues/15#issuecomment-939308821
 /// [2]: https://doc.rust-lang.org/beta/unstable-book/compiler-flags/location-detail.html
@@ -330,22 +391,18 @@ impl Expect {
         let mut line_start = 0;
         for (i, line) in lines_with_ends(file).enumerate() {
             if i == self.position.line as usize - 1 {
-                // `column` points to the first character of the macro invocation:
+                // `column` points to the first character of the macro invocation/function call:
                 //
-                //    expect![[r#""#]]        expect![""]
-                //    ^       ^               ^       ^
-                //  column   offset                 offset
+                //    expect![[r#""#]]    expect![""]    expect("")   expect([""])
+                //    ^       ^           ^       ^      ^      ^     ^       ^
+                //  column   offset
                 //
-                // Seek past the exclam, then skip any whitespace and
-                // the macro delimiter to get to our argument.
+                // we seek until we find the first character of the string literal, if present.
                 let byte_offset = line
                     .char_indices()
                     .skip((self.position.column - 1).try_into().unwrap())
-                    .skip_while(|&(_, c)| c != '!')
-                    .skip(1) // !
-                    .skip_while(|&(_, c)| c.is_whitespace())
-                    .skip(1) // [({
-                    .skip_while(|&(_, c)| c.is_whitespace())
+                    .skip_while(|&(_, c)| !matches!(c, '[' | '(' | '{'))
+                    .skip_while(|&(_, c)| matches!(c, '[' | '(' | '{') || c.is_whitespace())
                     .next()
                     .expect("Failed to parse macro invocation")
                     .0;
@@ -365,7 +422,7 @@ impl Expect {
         let literal_start = literal_start + (lit_to_eof.len() - lit_to_eof_trimmed.len());
 
         let literal_len =
-            locate_end(lit_to_eof_trimmed).expect("Couldn't find closing delimiter for `expect!`.");
+            locate_end(lit_to_eof_trimmed).expect("Couldn't find closing delimiter for `expect`.");
         let literal_range = literal_start..literal_start + literal_len;
         Location { line_indent, literal_range }
     }
@@ -378,16 +435,27 @@ fn locate_end(arg_start_to_eof: &str) -> Option<usize> {
         // expect![[]]
         '[' => {
             let str_start_to_eof = arg_start_to_eof[1..].trim_start();
-            let str_len = find_str_lit_len(str_start_to_eof)?;
+            let str_len = find_str_lit_len(str_start_to_eof)
+                .expect(&format!("couldn't find string after [ in {:?}", &arg_start_to_eof[..40]));
             let str_end_to_eof = &str_start_to_eof[str_len..];
-            let closing_brace_offset = str_end_to_eof.find(']')?;
+            let closing_brace_offset = str_end_to_eof.find(']').expect("couldn't find ]");
             Some((arg_start_to_eof.len() - str_end_to_eof.len()) + closing_brace_offset + 1)
+        }
+
+        // expect![[]]
+        '(' => {
+            let str_start_to_eof = arg_start_to_eof[1..].trim_start();
+            let str_len = find_str_lit_len(str_start_to_eof)
+                .expect(&format!("couldn't find string after ( in {:?}", &arg_start_to_eof[..40]));
+            let str_end_to_eof = &str_start_to_eof[str_len..];
+            let closing_bracket_offset = str_end_to_eof.find(')').expect("couldn't find )");
+            Some((arg_start_to_eof.len() - str_end_to_eof.len()) + closing_bracket_offset + 1)
         }
 
         // expect![] | expect!{} | expect!()
         ']' | '}' | ')' => Some(0),
 
-        // expect!["..."] | expect![r#"..."#]
+        // expect!["..."] | expect![r#"..."#] | expect("...")
         _ => find_str_lit_len(arg_start_to_eof),
     }
 }
@@ -746,7 +814,16 @@ mod tests {
 
     #[test]
     fn test_trivial_assert() {
-        expect!["5"].assert_eq("5");
+        expect!["1"].assert_eq("1");
+        expect!["2"].assert_eq("2");
+        expect!["3"].assert_eq("3");
+        expect![["4"]].assert_eq("4");
+    }
+
+    #[test]
+    fn test_trivial_assert_fn() {
+        expect("3").assert_eq("3");
+        expect(["4"]).assert_eq("4");
     }
 
     #[test]
